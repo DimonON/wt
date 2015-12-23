@@ -52,7 +52,19 @@ $interval_regexp =~ s!\|$!\$!;
 
 sub normalize_time($) {
     my $t = shift;
-    if ($t =~ m!^\d{2}[:._]\d{2}$!) { $t =~ s![:._]!:!i; return $t }
+    if ($t =~ m!^\d{2}[:._]\d{2}$!) {
+        $t =~ s![:._]!:!i;
+        
+        # Пост-валидация - заменяем 59 минут
+        if ($t =~ m!:59$!) {
+            $t = join(':', map { $_+=1 } split (/:/, $t));
+            $t =~ s!^24!00!;
+            $t =~ s!60$!00!;
+        }
+        
+        return $t;
+    }
+    
     elsif ($t =~ m!^\d$! and $t != 0) { return '0'.$t.':00' }
     elsif ($t =~ m!^\d{2}$!) { return $t.':00' }
 }

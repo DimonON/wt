@@ -50,28 +50,7 @@ $interval_regexp =~ s!\|$!\$!;
 
 
 
-sub normalize_time($) {
-    my $t = shift;
-    if ($t =~ m!^\d{2}[:._]\d{2}$!) {
-        $t =~ s![:._]!:!i;
-        
-        # Пост-валидация - заменяем 59 минут
-        if ($t =~ m!:59$!) {
-            $t = join(':', map { $_+=1 } split (/:/, $t));
-            $t =~ s!^24!00!;
-            $t =~ s!60$!00!;
-        }
-        
-        return $t;
-    }
-    
-    elsif ($t =~ m!^\d$! and $t != 0) { return '0'.$t.':00' }
-    elsif ($t =~ m!^\d{2}$!) { return $t.':00' }
-}
-
-
-
-sub normalize_schedule($) {
+sub _parse_schedule {
     my $schedule = shift;
     my @e = $schedule =~ m!$make_sense!gi;
     
@@ -86,6 +65,7 @@ sub normalize_schedule($) {
             my $day = $e[$i];
             foreach ( @{$config->{ru}} ) {
                 if ($day =~ m!$_->{regexp}!i) {
+                    # Индекс начального дня диапазона
                     $index = $_->{index};
                     # Валидация - День недели фигурирует в расписании более одного раза (в т.ч. в интервале)
                     if ( exists $extracted_days{$index} ) { die "ERROR! Validation is not passed (day-object appears more than once)\n" }
@@ -108,16 +88,22 @@ sub normalize_schedule($) {
             # а следом день недели - помещаем в каждый элемент интервала ЗАГОТОВКУ
             if ( $e[$i+1] =~ m!$days_regexp!i ) {
                 foreach ( @{$config->{ru}} ) {
-                    if ( $_->{index} > $index ) {
+                    if ( $_->{type} eq 'day' && $_->{index} > $index ) {
                         # Валидация - День недели фигурирует в расписании более одного раза (в т.ч. в интервале)
                         if ( exists $extracted_days{ $_->{index} } ) { die "ERROR! Validation is not passed (day-object appears more than once)\n" }
                         $extracted_days{ $_->{index} } = 1;
                         
                         # ЗАГОТОВКА
                         $s[ $_->{index} ] = { from => 'NA', to => 'NA' };
-                        last if ( $e[$i+1] =~ m!$_->{regexp}!i )
+                        if ( $e[$i+1] =~ m!$_->{regexp}!i ) {
+                            undef $index;
+                            last;
+                        }
                     }
                 }
+                # Валидация - Интервал дней ПОЗДНИЙ-РАННИЙ. Когда индексы дней недели закончились, а правая граница интервала так и не встретилась.
+                if (defined $index) { die "ERROR! Validation is not passed (interval-object between later and earlier or the same days)\n" }
+                
                 $i+=2;
             }
             
@@ -139,23 +125,81 @@ sub normalize_schedule($) {
         # Если часы работы - помещаем время в первую незанятую ЗАГОТОВКУ
         elsif ( $e[$i] =~ m!$time_regexp!i ) {
             # Валидация - более двух цифр подряд
-            if ( $e[$i+1] =~ m!$time_regexp!i and $e[$i+2] =~ m!$time_regexp!i ) { die "ERROR! Validation is not passed (more than two consecutive hours-objects)\n" }
+            if ( (defined $e[$i+2]) &&
+                 ($e[$i+1] =~ m!$time_regexp!i and $e[$i+2] =~ m!$time_regexp!i) ) { die "ERROR! Validation is not passed (more than two consecutive hours-objects)\n" }
             
             foreach (@s) {
-                if (defined ($_->{from}) and $_->{from} eq 'NA') { $_->{from} = normalize_time($e[$i]); next }
-                if (defined ($_->{to}) and $_->{to} eq 'NA') { $_->{to} = normalize_time($e[$i]); next }
+                if (defined ($_->{from}) and $_->{from} eq 'NA') { $_->{from} = _normalize_schedule_time($e[$i]); next }
+                if (defined ($_->{to}) and $_->{to} eq 'NA') {
+                    $_->{to} = _normalize_schedule_time($e[$i]);
+                    # Валидация - Время окончания работы меньше времени начала
+                    my ($x, $y) = map { my $z = $_; $z =~ s!:!!g; $z } ( $_->{from}, $_->{to} );
+                    if (    ($y && $x) and
+                            ($x < 200000) and
+                            ($y <= $x)
+                            ) { die "ERROR! Validation is not passed (TO hours-object is less than FROM hours-object in working time)\n" }
+                    
+                    next;
+                }
                 
-                if (defined ($_->{break}) and $_->{break}->{from} eq 'NA') { $_->{break}->{from} = normalize_time($e[$i]); next }
-                if (defined ($_->{break}) and $_->{break}->{to} eq 'NA') { $_->{break}->{to} = normalize_time($e[$i]) }
+                if (defined ($_->{break}) and $_->{break}->{from} eq 'NA') { $_->{break}->{from} = _normalize_schedule_time($e[$i]); next }
+                if (defined ($_->{break}) and $_->{break}->{to} eq 'NA') {
+                    $_->{break}->{to} = _normalize_schedule_time($e[$i]);
+                    # Валидация - Время окончания перерыва меньше времени начала
+                    my ($x, $y) = map { my $z = $_; $z =~ s!:!!g; $z } ( $_->{break}->{from}, $_->{break}->{to} );
+                    if (    ($y && $x) and
+                            ($x < 200000) and
+                            ($y <= $x)
+                            ) { die "ERROR! Validation is not passed (TO hours-object is less than FROM hours-object in break)\n" }
+                    
+                    # Валидация - Перерыв выходит за рамки времени работы
+                    my ($xx, $yy) = map { my $z = $_; $z =~ s!:!!g; $z } ( $_->{from}, $_->{to} );
+                    my $steps;
+                    until ( ($xx < $x) && ($x < $y) && ($y < $yy) ) {
+                        for ($xx, $x, $y, $yy) { $_ =~ s!^24(.*)!00$1! if $_ >= 240000; $_+=10000 }
+                        $steps++;
+                        if ($steps > 24) { die "ERROR! Validation is not passed (break interval is out of working time)\n" }
+                    }
+                }
             }
             $i++;
             $time_obj_cnt++;
         }
     }
     
-    # Валидация -количество цифр не кратно двум
+    # Валидация - отсутствуют часы работы
+    unless (defined $time_obj_cnt) { die "ERROR! Validation is not passed (no one hours-object was found)\n" }
+    # Валидация - количество цифр не кратно двум
     if ($time_obj_cnt % 2) { die "ERROR! Validation is not passed (the count of hours-objects is not a multiple of two)\n" }
-    p @s;
+    # Валидация - отсутствуют дни работы
+    unless (%extracted_days) { $schedule =~ s!^!пн-вс !; return _parse_schedule($schedule) }
+    
+    return \@s;
 }
 
-normalize_schedule($schedule_arg);
+
+
+sub _normalize_schedule_time {
+    my $t = shift;
+    if ($t =~ m!^\d{2}([:._]\d{2}){1,2}$!) {
+        $t =~ s![:._]!:!g;
+        if ($t =~ m!^\d{2}:\d{2}:\d{2}$!) { $t =~ s!:\d{2}$!! }
+        
+        # Пост-валидация - заменяем 59 минут
+        if ($t =~ m!:59$!) {
+            $t = join(':', map { $_+=1 } split (/:/, $t));
+            $t =~ s!^24!00!;
+            $t =~ s!60$!00!;
+        }
+        
+        return $t.':00';
+    }
+    
+    elsif ($t =~ m!^\d$! and $t != 0) { return '0'.$t.':00:00' }
+    elsif ($t =~ m!^\d{2}$!) { return $t.':00:00' }
+}
+
+
+
+my $p = _parse_schedule($schedule_arg);
+p  $p;
